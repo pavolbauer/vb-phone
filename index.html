@@ -78,7 +78,7 @@ button:focus-visible,input:focus-visible{outline:3px solid var(--lcd-ink);outlin
 .pad[aria-pressed="true"]{outline:3px solid var(--ink);outline-offset:3px}
 
 /* knobs */
-.knob{display:grid;grid-template-columns:5.2rem 1fr 2.8rem;align-items:center;gap:10px}
+.knob{display:grid;grid-template-columns:5.8rem 1fr 2.8rem;align-items:center;gap:10px}
 .knob label{font-size:.78rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase}
 .knob output{font-family:var(--f-lcd);font-size:1.3rem;color:var(--lcd-ink);text-align:right;font-variant-numeric:tabular-nums}
 input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:36px;background:transparent;margin:0}
@@ -159,6 +159,11 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;bac
       <input type="range" id="kPitch" min="-12" max="12" step="1" value="0">
       <output id="oPitch">0</output>
     </div>
+    <div class="knob" style="--k:#8bd346">
+      <label for="kTune">Autotune</label>
+      <input type="range" id="kTune" min="0" max="100" step="1" value="0">
+      <output id="oTune">0</output>
+    </div>
     <div class="knob" style="--k:#3ec1f3">
       <label for="kRobot">Robot</label>
       <input type="range" id="kRobot" min="0" max="100" step="1" value="0">
@@ -208,15 +213,42 @@ const inFrame = (() => { try { return window.self !== window.top; } catch (e) { 
 /* ---------- pitch shifter (AudioWorklet) ---------- */
 const WORKLET = `
 class PitchShift extends AudioWorkletProcessor {
-  static get parameterDescriptors(){ return [{name:'ratio',defaultValue:1,minValue:0.25,maxValue:4,automationRate:'k-rate'}]; }
-  constructor(){ super(); this.size=16384; this.buf=new Float32Array(this.size); this.w=0; this.win=Math.round(sampleRate*0.05); this.p=0; }
+  static get parameterDescriptors(){ return [
+    {name:'ratio',defaultValue:1,minValue:0.25,maxValue:4,automationRate:'k-rate'},
+    {name:'tune',defaultValue:0,minValue:0,maxValue:1,automationRate:'k-rate'}]; }
+  constructor(){
+    super(); this.size=16384; this.buf=new Float32Array(this.size); this.w=0; this.win=Math.round(sampleRate*0.05); this.p=0;
+    // autotune: pitch detection on a 4x decimated copy of the input
+    this.N=512; this.dec=new Float32Array(this.N); this.lin=new Float32Array(this.N); this.d=new Float32Array(170);
+    this.di=0; this.acc=0; this.accN=0; this.hop=0; this.corr=1;
+  }
   read(d){ let pos=this.w-d; while(pos<0) pos+=this.size; const i=Math.floor(pos), f=pos-i; const a=this.buf[i%this.size], b=this.buf[(i+1)%this.size]; return a+(b-a)*f; }
+  detect(base, tune){
+    const N=this.N, W=256, TMIN=12, TMAX=160, x=this.lin, d=this.d;
+    for (let i=0;i<N;i++) x[i]=this.dec[(this.di+i)%N];
+    let e=0; for (let i=0;i<W;i++) e+=x[i]*x[i];
+    let best=-1;
+    if (e/W > 2e-5){
+      let run=0; d[0]=1;
+      for (let t=1;t<=TMAX;t++){ let s=0; for (let j=0;j<W;j++){ const df=x[j]-x[j+t]; s+=df*df; } run+=s; d[t]=run>0 ? s*t/run : 1; }
+      for (let t=TMIN;t<TMAX;t++){ if (d[t]<0.2){ while (t+1<TMAX && d[t+1]<d[t]) t++; best=t; break; } }
+    }
+    if (best<0){ this.corr += (1-this.corr)*0.2; return; }
+    const A=d[best-1], B=d[best], C=d[best+1], den=A-2*B+C;
+    const tt = den ? best+0.5*(A-C)/den : best;
+    const f = (sampleRate/4)/tt;
+    const m = 69+12*Math.log2(f*base/440);
+    this.corr = Math.pow(2, (Math.round(m)-m)*tune/12);   // hard snap to the nearest note
+  }
   process(inputs, outputs, params){
-    const inp = inputs[0] && inputs[0][0]; const out = outputs[0]; const r = params.ratio[0];
-    const n = out[0].length, step = (1-r)/this.win, W = this.win;
+    const inp = inputs[0] && inputs[0][0]; const out = outputs[0];
+    const base = params.ratio[0], tune = params.tune[0];
+    const r = tune>0 ? base*this.corr : base;
+    const n = out[0].length, step = (1-r)/this.win, W = this.win, bypass = tune===0 && Math.abs(r-1)<0.001;
     for (let k=0;k<n;k++){
       const x = inp ? inp[k] : 0; this.buf[this.w] = x; let y;
-      if (Math.abs(r-1) < 0.001) y = x;
+      if (tune>0){ this.acc+=x; if (++this.accN===4){ this.dec[this.di]=this.acc/4; this.di=(this.di+1)%this.N; this.acc=0; this.accN=0; } }
+      if (bypass) y = x;
       else {
         const p1 = this.p; let p2 = p1+0.5; if (p2>=1) p2-=1;
         const s1 = Math.sin(Math.PI*p1), s2 = Math.sin(Math.PI*p2);
@@ -226,6 +258,7 @@ class PitchShift extends AudioWorkletProcessor {
       this.w = (this.w+1)%this.size;
       for (let c=0;c<out.length;c++) out[c][k] = y;
     }
+    if (tune>0){ this.hop+=n; if (this.hop>=256){ this.hop=0; this.detect(base, tune); } }
     return true;
   }
 }
@@ -234,7 +267,7 @@ registerProcessor('pitch-shift', PitchShift);`;
 /* ---------- voices ---------- */
 const VOICES = [
   {id:'normal',  name:'Normal',   sub:'just you',     color:'#f4f1ff', p:{pitch:0,  harmony:'off', robot:0,   robotHz:55,  echo:0,    reverb:0.1}},
-  {id:'chip',    name:'Chipmunk', sub:'up 7',         color:'#ffd23f', p:{pitch:7,  harmony:'off', robot:0,   robotHz:55,  echo:0,    reverb:0.1}},
+  {id:'trap',    name:'Trap',     sub:'autotune',     color:'#ffd23f', p:{pitch:-3, harmony:'deep',robot:0,   robotHz:55,  echo:0.3,  reverb:0.25, tune:1, echoTime:0.214}},
   {id:'mouse',   name:'Mouse',    sub:'up 12',        color:'#8bd346', p:{pitch:12, harmony:'off', robot:0,   robotHz:55,  echo:0.1,  reverb:0.05}},
   {id:'monster', name:'Monster',  sub:'down 7',       color:'#ff8c42', p:{pitch:-7, harmony:'off', robot:0.15,robotHz:30,  echo:0,    reverb:0.3}},
   {id:'giant',   name:'Giant',    sub:'down 12',      color:'#ff4d4d', p:{pitch:-12,harmony:'off', robot:0,   robotHz:55,  echo:0.2,  reverb:0.5}},
@@ -244,7 +277,8 @@ const VOICES = [
   {id:'cave',    name:'Cave',     sub:'hello-lo-lo',  color:'#ff5fa2', p:{pitch:-2, harmony:'off', robot:0,   robotHz:55,  echo:0.6,  reverb:0.8}},
 ];
 const HARM = {off:[], duet:[4], trio:[4,7], deep:[-12]};
-const params = Object.assign({}, VOICES[0].p);
+const DEFAULTS = {tune:0, echoTime:0.3};
+const params = Object.assign({}, DEFAULTS, VOICES[0].p);
 let voiceName = 'NORMAL';
 
 /* ---------- audio graph ---------- */
@@ -259,7 +293,7 @@ function makePitch(c){
   if (!workletOK){ const g = c.createGain(); g.fake = true; return g; }
   return new AudioWorkletNode(c, 'pitch-shift', {numberOfInputs:1, numberOfOutputs:1, channelCount:1, channelCountMode:'explicit', channelInterpretation:'speakers', outputChannelCount:[1]});
 }
-function setRatio(node, semis, t){ if (!node.fake) node.parameters.get('ratio').setValueAtTime(Math.pow(2, semis/12), t); }
+function setRatio(node, semis, t, tune){ if (node.fake) return; node.parameters.get('ratio').setValueAtTime(Math.pow(2, semis/12), t); node.parameters.get('tune').setValueAtTime(tune || 0, t); }
 
 function buildChain(c){
   const input = c.createGain();
@@ -296,12 +330,12 @@ function buildChain(c){
     update(p, instant){
       const t = c.currentTime;
       const set = (ap, v) => instant ? ap.setValueAtTime(v, t) : ap.setTargetAtTime(v, t, 0.03);
-      setRatio(main, p.pitch, t);
+      setRatio(main, p.pitch, t, p.tune);
       const iv = HARM[p.harmony] || [];
-      if (iv.length > 0){ setRatio(h1, p.pitch+iv[0], t); set(h1g.gain, workletOK ? 0.6 : 0); } else set(h1g.gain, 0);
-      if (iv.length > 1){ setRatio(h2, p.pitch+iv[1], t); set(h2g.gain, workletOK ? 0.5 : 0); } else set(h2g.gain, 0);
+      if (iv.length > 0){ setRatio(h1, p.pitch+iv[0], t, p.tune); set(h1g.gain, workletOK ? 0.6 : 0); } else { setRatio(h1, 0, t, 0); set(h1g.gain, 0); }
+      if (iv.length > 1){ setRatio(h2, p.pitch+iv[1], t, p.tune); set(h2g.gain, workletOK ? 0.5 : 0); } else { setRatio(h2, 0, t, 0); set(h2g.gain, 0); }
       set(rDry.gain, 1 - 0.9*p.robot); set(rWet.gain, 1.7*p.robot); set(osc.frequency, p.robotHz);
-      set(eSend.gain, p.echo*0.75); set(eFb.gain, 0.25 + 0.4*p.echo);
+      set(eSend.gain, p.echo*0.75); set(eDel.delayTime, p.echoTime); set(eFb.gain, 0.25 + 0.4*p.echo);
       set(rvSend.gain, p.reverb*0.9);
     }
   };
@@ -521,15 +555,15 @@ const DB = {
 };
 
 /* ---------- controls ---------- */
-const knobs = {pitch:'#kPitch', robot:'#kRobot', echo:'#kEcho', reverb:'#kReverb'};
+const knobs = {pitch:'#kPitch', tune:'#kTune', robot:'#kRobot', echo:'#kEcho', reverb:'#kReverb'};
 function syncUI(){
   const pv = params.pitch;
   $('#kPitch').value = pv; $('#oPitch').textContent = pv > 0 ? '+' + pv : pv;
-  ['robot', 'echo', 'reverb'].forEach(k => { const v = Math.round(params[k]*100); $(knobs[k]).value = v; $('#o' + k[0].toUpperCase() + k.slice(1)).textContent = v; });
+  ['tune', 'robot', 'echo', 'reverb'].forEach(k => { const v = Math.round(params[k]*100); $(knobs[k]).value = v; $('#o' + k[0].toUpperCase() + k.slice(1)).textContent = v; });
   Object.values(knobs).forEach(sel => { const el = $(sel); el.style.setProperty('--fill', ((el.value - el.min)/(el.max - el.min)*100) + '%'); });
   document.querySelectorAll('#harm button').forEach(b => b.setAttribute('aria-pressed', b.dataset.h === params.harmony));
   $('#lcdVoice').textContent = voiceName;
-  $('#lcdInfo').textContent = `PITCH ${pv > 0 ? '+' + pv : pv}${params.harmony !== 'off' ? '  ' + params.harmony.toUpperCase() : ''}`;
+  $('#lcdInfo').textContent = `PITCH ${pv > 0 ? '+' + pv : pv}${params.tune > 0 ? '  TUNE' : ''}${params.harmony !== 'off' ? '  ' + params.harmony.toUpperCase() : ''}`;
 }
 function applyParams(){ if (chain) chain.update(params); syncUI(); }
 function setCustom(){ voiceName = 'CUSTOM'; document.querySelectorAll('.pad').forEach(p => p.setAttribute('aria-pressed', 'false')); }
@@ -539,14 +573,14 @@ $('#pads').addEventListener('click', async e => {
   const b = e.target.closest('.pad'); if (!b) return;
   await ensureAudio();
   const v = VOICES[+b.dataset.i];
-  Object.assign(params, v.p); voiceName = v.name.toUpperCase();
+  Object.assign(params, DEFAULTS, v.p); voiceName = v.name.toUpperCase();
   document.querySelectorAll('.pad').forEach(p => p.setAttribute('aria-pressed', p === b));
   applyParams();
   // quick preview: nothing is sounding, so play the newest take in the new voice
   if (!playing.size && !monitoring && !isRecording() && takes.length) play(takes[0]);
 });
 $('#kPitch').addEventListener('input', e => { params.pitch = +e.target.value; setCustom(); applyParams(); });
-['robot', 'echo', 'reverb'].forEach(k => $(knobs[k]).addEventListener('input', e => { params[k] = e.target.value/100; setCustom(); applyParams(); }));
+['tune', 'robot', 'echo', 'reverb'].forEach(k => $(knobs[k]).addEventListener('input', e => { params[k] = e.target.value/100; setCustom(); applyParams(); }));
 $('#harm').addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; params.harmony = b.dataset.h; setCustom(); applyParams(); });
 $('#recBtn').addEventListener('click', toggleRec);
 $('#liveBtn').addEventListener('click', toggleLive);
