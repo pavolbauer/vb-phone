@@ -83,7 +83,7 @@ button:focus-visible,input:focus-visible{outline:3px solid var(--lcd-ink);outlin
 .pad[aria-pressed="true"]{outline:3px solid var(--ink);outline-offset:3px}
 
 /* knobs */
-.knob{display:grid;grid-template-columns:5.8rem 1fr 2.8rem;align-items:center;gap:10px}
+.knob{display:grid;grid-template-columns:5.8rem 1fr 3.4rem;align-items:center;gap:10px}
 .knob label{font-size:.78rem;font-weight:700;letter-spacing:.1em;text-transform:uppercase}
 .knob output{font-family:var(--f-lcd);font-size:1.3rem;color:var(--lcd-ink);text-align:right;font-variant-numeric:tabular-nums}
 input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:36px;background:transparent;margin:0}
@@ -168,8 +168,8 @@ input[type=range]::-moz-range-thumb{width:20px;height:20px;border-radius:50%;bac
     <h2>TWEAK <small>works on old recordings too</small></h2>
     <div class="knob" style="--k:#ffd23f">
       <label for="kPitch">Pitch</label>
-      <input type="range" id="kPitch" min="-12" max="12" step="1" value="0">
-      <output id="oPitch">0</output>
+      <input type="range" id="kPitch" min="-12" max="12" step="0.1" value="0">
+      <output id="oPitch">0.0</output>
     </div>
     <div class="knob" style="--k:#8bd346">
       <label for="kTune">Autotune</label>
@@ -232,7 +232,7 @@ class PitchShift extends AudioWorkletProcessor {
     super(); this.size=16384; this.buf=new Float32Array(this.size); this.w=0; this.win=Math.round(sampleRate*0.05); this.p=0;
     // autotune: pitch detection on a 4x decimated copy of the input
     this.N=512; this.dec=new Float32Array(this.N); this.lin=new Float32Array(this.N); this.d=new Float32Array(170);
-    this.di=0; this.acc=0; this.accN=0; this.hop=0; this.corr=1;
+    this.di=0; this.acc=0; this.accN=0; this.hop=0; this.corr=1; this.rs=1;
   }
   read(d){ let pos=this.w-d; while(pos<0) pos+=this.size; const i=Math.floor(pos), f=pos-i; const a=this.buf[i%this.size], b=this.buf[(i+1)%this.size]; return a+(b-a)*f; }
   detect(base, tune){
@@ -255,7 +255,10 @@ class PitchShift extends AudioWorkletProcessor {
   process(inputs, outputs, params){
     const inp = inputs[0] && inputs[0][0]; const out = outputs[0];
     const base = params.ratio[0], tune = params.tune[0];
-    const r = tune>0 ? base*this.corr : base;
+    const target = tune>0 ? base*this.corr : base;
+    this.rs += (target-this.rs)*0.12;                 // ~20 ms glide between pitch changes
+    if (Math.abs(target-this.rs) < 1e-4) this.rs = target;
+    const r = this.rs;
     const n = out[0].length, step = (1-r)/this.win, W = this.win, bypass = tune===0 && Math.abs(r-1)<0.001;
     for (let k=0;k<n;k++){
       const x = inp ? inp[k] : 0; this.buf[this.w] = x; let y;
@@ -619,13 +622,13 @@ const DB = {
 /* ---------- controls ---------- */
 const knobs = {pitch:'#kPitch', tune:'#kTune', robot:'#kRobot', echo:'#kEcho', reverb:'#kReverb'};
 function syncUI(){
-  const pv = params.pitch;
-  $('#kPitch').value = pv; $('#oPitch').textContent = pv > 0 ? '+' + pv : pv;
+  const pv = Math.round(params.pitch*10)/10, pvs = (pv > 0 ? '+' : '') + pv.toFixed(1);
+  $('#kPitch').value = pv; $('#oPitch').textContent = pvs;
   ['tune', 'robot', 'echo', 'reverb'].forEach(k => { const v = Math.round(params[k]*100); $(knobs[k]).value = v; $('#o' + k[0].toUpperCase() + k.slice(1)).textContent = v; });
   Object.values(knobs).forEach(sel => { const el = $(sel); el.style.setProperty('--fill', ((el.value - el.min)/(el.max - el.min)*100) + '%'); });
   document.querySelectorAll('#harm button').forEach(b => b.setAttribute('aria-pressed', b.dataset.h === params.harmony));
   $('#lcdVoice').textContent = voiceName;
-  $('#lcdInfo').textContent = `PITCH ${pv > 0 ? '+' + pv : pv}${params.tune > 0 ? '  TUNE' : ''}${params.harmony !== 'off' ? '  ' + params.harmony.toUpperCase() : ''}`;
+  $('#lcdInfo').textContent = `PITCH ${pvs}${params.tune > 0 ? '  TUNE' : ''}${params.harmony !== 'off' ? '  ' + params.harmony.toUpperCase() : ''}`;
 }
 function applyParams(){ if (chain) chain.update(params); if (live) live.chain.update(liveParams()); syncUI(); }
 function setCustom(){ voiceName = 'CUSTOM'; document.querySelectorAll('.pad').forEach(p => p.setAttribute('aria-pressed', 'false')); }
